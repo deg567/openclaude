@@ -1,7 +1,8 @@
 // @ts-nocheck
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { homedir } from 'node:os'
 
 type CheckResult = {
   ok: boolean
@@ -96,6 +97,27 @@ function currentBaseUrl(): string {
   return process.env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1'
 }
 
+function getCodexAuthPath(): string {
+  return join(process.env.CODEX_HOME || join(homedir(), '.codex'), 'auth.json')
+}
+
+function readCodexAuthSession(): { accessToken: string; accountId: string } | null {
+  const authPath = getCodexAuthPath()
+  if (!existsSync(authPath)) return null
+
+  try {
+    const parsed = JSON.parse(readFileSync(authPath, 'utf8'))
+    const accessToken = parsed?.tokens?.access_token
+    const accountId =
+      parsed?.tokens?.account_id ||
+      parsed?.tokens?.id_token?.['https://api.openai.com/auth']?.chatgpt_account_id
+    if (!accessToken || !accountId) return null
+    return { accessToken, accountId }
+  } catch {
+    return null
+  }
+}
+
 function checkOpenAIEnv(): CheckResult[] {
   const results: CheckResult[] = []
   const useOpenAI = isTruthy(process.env.CLAUDE_CODE_USE_OPENAI)
@@ -108,6 +130,9 @@ function checkOpenAIEnv(): CheckResult[] {
   const baseUrl = process.env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1'
   const model = process.env.OPENAI_MODEL
   const key = process.env.OPENAI_API_KEY
+  const wantsCodexOAuth =
+    process.env.OPENAI_AUTH_MODE === 'codex' || isTruthy(process.env.OPENAI_USE_CODEX_OAUTH)
+  const codexAuthPath = getCodexAuthPath()
 
   results.push(pass('Provider mode', 'OpenAI-compatible provider enabled.'))
 
@@ -119,7 +144,13 @@ function checkOpenAIEnv(): CheckResult[] {
 
   results.push(pass('OPENAI_BASE_URL', baseUrl))
 
-  if (key === 'SUA_CHAVE') {
+  if (wantsCodexOAuth) {
+    if (!existsSync(codexAuthPath)) {
+      results.push(fail('Codex auth cache', `Missing ${codexAuthPath}. Run codex login first.`))
+    } else {
+      results.push(pass('Codex auth cache', codexAuthPath))
+    }
+  } else if (key === 'SUA_CHAVE') {
     results.push(fail('OPENAI_API_KEY', 'Placeholder value detected: SUA_CHAVE.'))
   } else if (!key && !isLocalBaseUrl(baseUrl)) {
     results.push(fail('OPENAI_API_KEY', 'Missing key for non-local provider URL.'))
@@ -139,20 +170,47 @@ async function checkBaseUrlReachability(): Promise<CheckResult> {
 
   const baseUrl = currentBaseUrl()
   const key = process.env.OPENAI_API_KEY
-  const endpoint = `${baseUrl.replace(/\/$/, '')}/models`
+  const wantsCodexOAuth =
+    process.env.OPENAI_AUTH_MODE === 'codex' || isTruthy(process.env.OPENAI_USE_CODEX_OAUTH)
+  const endpoint = wantsCodexOAuth
+    ? `${baseUrl.replace(/\/$/, '')}/responses`
+    : `${baseUrl.replace(/\/$/, '')}/models`
+  const codexSession = wantsCodexOAuth ? readCodexAuthSession() : null
 
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 4000)
 
   try {
     const headers: Record<string, string> = {}
+    if (wantsCodexOAuth) {
+      headers.Accept = 'text/event-stream'
+      if (codexSession) {
+        headers.Authorization = `Bearer ${codexSession.accessToken}`
+        headers['ChatGPT-Account-ID'] = codexSession.accountId
+      }
+    }
     if (key) {
       headers.Authorization = `Bearer ${key}`
     }
 
     const response = await fetch(endpoint, {
-      method: 'GET',
+      method: wantsCodexOAuth ? 'POST' : 'GET',
       headers,
+      ...(wantsCodexOAuth
+        ? {
+            body: JSON.stringify({
+              model: process.env.OPENAI_MODEL || 'gpt-5',
+              instructions: 'Health check',
+              input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'ping' }] }],
+              tools: [],
+              tool_choice: 'auto',
+              parallel_tool_calls: true,
+              store: false,
+              stream: true,
+              include: [],
+            }),
+          }
+        : {}),
       signal: controller.signal,
     })
 
@@ -211,6 +269,7 @@ function checkOllamaProcessorMode(): CheckResult {
 function serializeSafeEnvSummary(): Record<string, string | boolean> {
   return {
     CLAUDE_CODE_USE_OPENAI: isTruthy(process.env.CLAUDE_CODE_USE_OPENAI),
+    OPENAI_AUTH_MODE: process.env.OPENAI_AUTH_MODE ?? '(unset)',
     OPENAI_MODEL: process.env.OPENAI_MODEL ?? '(unset)',
     OPENAI_BASE_URL: process.env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1',
     OPENAI_API_KEY_SET: Boolean(process.env.OPENAI_API_KEY),

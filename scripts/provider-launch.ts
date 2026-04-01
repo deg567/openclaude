@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
-type ProviderProfile = 'openai' | 'ollama'
+type ProviderProfile = 'codex' | 'openai' | 'ollama'
 
 type ProfileFile = {
   profile: ProviderProfile
@@ -11,6 +11,8 @@ type ProfileFile = {
     OPENAI_BASE_URL?: string
     OPENAI_MODEL?: string
     OPENAI_API_KEY?: string
+    OPENAI_AUTH_MODE?: string
+    OPENAI_USE_CODEX_OAUTH?: string
   }
 }
 
@@ -32,7 +34,7 @@ function parseLaunchOptions(argv: string[]): LaunchOptions {
       continue
     }
 
-    if ((lower === 'auto' || lower === 'openai' || lower === 'ollama') && requestedProfile === 'auto') {
+    if ((lower === 'auto' || lower === 'codex' || lower === 'openai' || lower === 'ollama') && requestedProfile === 'auto') {
       requestedProfile = lower as ProviderProfile | 'auto'
       continue
     }
@@ -62,7 +64,7 @@ function loadPersistedProfile(): ProfileFile | null {
   if (!existsSync(path)) return null
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8')) as ProfileFile
-    if (parsed.profile === 'openai' || parsed.profile === 'ollama') {
+    if (parsed.profile === 'codex' || parsed.profile === 'openai' || parsed.profile === 'ollama') {
       return parsed
     }
     return null
@@ -115,6 +117,18 @@ function buildEnv(profile: ProviderProfile, persisted: ProfileFile | null): Node
     return env
   }
 
+  if (profile === 'codex') {
+    env.OPENAI_BASE_URL =
+      process.env.OPENAI_BASE_URL ||
+      persistedEnv.OPENAI_BASE_URL ||
+      'https://chatgpt.com/backend-api/codex'
+    env.OPENAI_MODEL = process.env.OPENAI_MODEL || persistedEnv.OPENAI_MODEL || 'gpt-5'
+    env.OPENAI_AUTH_MODE = 'codex'
+    env.OPENAI_USE_CODEX_OAUTH = '1'
+    delete env.OPENAI_API_KEY
+    return env
+  }
+
   env.OPENAI_BASE_URL = process.env.OPENAI_BASE_URL || persistedEnv.OPENAI_BASE_URL || 'https://api.openai.com/v1'
   env.OPENAI_MODEL = process.env.OPENAI_MODEL || persistedEnv.OPENAI_MODEL || 'gpt-4o'
   env.OPENAI_API_KEY = process.env.OPENAI_API_KEY || persistedEnv.OPENAI_API_KEY
@@ -148,7 +162,7 @@ async function main(): Promise<void> {
   const options = parseLaunchOptions(process.argv.slice(2))
   const requestedProfile = options.requestedProfile
   if (!requestedProfile) {
-    console.error('Usage: bun run scripts/provider-launch.ts [openai|ollama|auto] [--fast] [-- <cli args>]')
+    console.error('Usage: bun run scripts/provider-launch.ts [codex|openai|ollama|auto] [--fast] [-- <cli args>]')
     process.exit(1)
   }
 

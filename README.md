@@ -54,6 +54,18 @@ export OPENAI_API_KEY=sk-your-key-here
 export OPENAI_MODEL=gpt-4o
 ```
 
+Or use your existing Codex / ChatGPT login:
+
+```bash
+codex login
+
+export CLAUDE_CODE_USE_OPENAI=1
+export OPENAI_AUTH_MODE=codex
+export OPENAI_USE_CODEX_OAUTH=1
+export OPENAI_BASE_URL=https://chatgpt.com/backend-api/codex
+export OPENAI_MODEL=gpt-5
+```
+
 ### 2. Run it
 
 ```bash
@@ -80,6 +92,18 @@ The npm package name is `@gitlawb/openclaude`, but the installed CLI command is 
 export CLAUDE_CODE_USE_OPENAI=1
 export OPENAI_API_KEY=sk-...
 export OPENAI_MODEL=gpt-4o
+```
+
+### Codex OAuth (ChatGPT plan)
+
+```bash
+codex login
+
+export CLAUDE_CODE_USE_OPENAI=1
+export OPENAI_AUTH_MODE=codex
+export OPENAI_USE_CODEX_OAUTH=1
+export OPENAI_BASE_URL=https://chatgpt.com/backend-api/codex
+export OPENAI_MODEL=gpt-5
 ```
 
 ### DeepSeek
@@ -162,6 +186,8 @@ export OPENAI_MODEL=gpt-4o
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `CLAUDE_CODE_USE_OPENAI` | Yes | Set to `1` to enable the OpenAI provider |
+| `OPENAI_AUTH_MODE` | No | Set to `codex` to use `~/.codex/auth.json` instead of `OPENAI_API_KEY` |
+| `OPENAI_USE_CODEX_OAUTH` | No | Set to `1` to enable Codex / ChatGPT OAuth mode |
 | `OPENAI_API_KEY` | Yes* | Your API key (*not needed for local models like Ollama) |
 | `OPENAI_MODEL` | Yes | Model name (e.g. `gpt-4o`, `deepseek-chat`, `llama3.3:70b`) |
 | `OPENAI_BASE_URL` | No | API endpoint (defaults to `https://api.openai.com/v1`) |
@@ -209,11 +235,17 @@ bun run profile:init
 # openai bootstrap with explicit key
 bun run profile:init -- --provider openai --api-key sk-...
 
+# codex bootstrap (reuses ~/.codex/auth.json from `codex login`)
+bun run profile:init -- --provider codex
+
 # ollama bootstrap with custom model
 bun run profile:init -- --provider ollama --model llama3.1:8b
 
 # launch using persisted profile (.openclaude-profile.json)
 bun run dev:profile
+
+# Codex OAuth profile (requires `codex login` first)
+bun run dev:codex
 
 # OpenAI profile (requires OPENAI_API_KEY in your shell)
 bun run dev:openai

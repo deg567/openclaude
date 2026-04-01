@@ -2,7 +2,7 @@
 import { writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
-type ProviderProfile = 'openai' | 'ollama'
+type ProviderProfile = 'codex' | 'openai' | 'ollama'
 
 type ProfileFile = {
   profile: ProviderProfile
@@ -10,6 +10,8 @@ type ProfileFile = {
     OPENAI_BASE_URL?: string
     OPENAI_MODEL?: string
     OPENAI_API_KEY?: string
+    OPENAI_AUTH_MODE?: string
+    OPENAI_USE_CODEX_OAUTH?: string
   }
   createdAt: string
 }
@@ -23,7 +25,7 @@ function parseArg(name: string): string | null {
 
 function parseProviderArg(): ProviderProfile | 'auto' {
   const p = parseArg('--provider')?.toLowerCase()
-  if (p === 'openai' || p === 'ollama') return p
+  if (p === 'codex' || p === 'openai' || p === 'ollama') return p
   return 'auto'
 }
 
@@ -69,6 +71,11 @@ async function main(): Promise<void> {
     env.OPENAI_MODEL = argModel || process.env.OPENAI_MODEL || 'llama3.1:8b'
     const key = sanitizeApiKey(argApiKey || process.env.OPENAI_API_KEY || null)
     if (key) env.OPENAI_API_KEY = key
+  } else if (selected === 'codex') {
+    env.OPENAI_BASE_URL = argBaseUrl || process.env.OPENAI_BASE_URL || 'https://chatgpt.com/backend-api/codex'
+    env.OPENAI_MODEL = argModel || process.env.OPENAI_MODEL || 'gpt-5'
+    env.OPENAI_AUTH_MODE = 'codex'
+    env.OPENAI_USE_CODEX_OAUTH = '1'
   } else {
     env.OPENAI_BASE_URL = argBaseUrl || process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1'
     env.OPENAI_MODEL = argModel || process.env.OPENAI_MODEL || 'gpt-4o'

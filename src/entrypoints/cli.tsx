@@ -48,10 +48,17 @@ function validateProviderEnvOrExit(): void {
 
   const apiKey = process.env.OPENAI_API_KEY
   const baseUrl = process.env.OPENAI_BASE_URL
+  const wantsCodexOAuth =
+    process.env.OPENAI_AUTH_MODE === 'codex' ||
+    isEnvTruthy(process.env.OPENAI_USE_CODEX_OAUTH)
 
   if (apiKey === 'SUA_CHAVE') {
     console.error('Invalid OPENAI_API_KEY: placeholder value SUA_CHAVE detected. Set a real key or unset for local providers.')
     process.exit(1)
+  }
+
+  if (wantsCodexOAuth) {
+    return
   }
 
   if (!apiKey && !isLocalProviderUrl(baseUrl)) {

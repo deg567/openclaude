@@ -1,3 +1,5 @@
+import { getCodexAuthSession } from './codexAuth.js'
+
 /**
  * OpenAI-compatible API shim for Claude Code.
  *
@@ -50,6 +52,10 @@ interface OpenAIMessage {
   tool_call_id?: string
   name?: string
 }
+
+type ResponsesInputItem = Record<string, unknown>
+
+type ShimDialect = 'chat-completions' | 'responses'
 
 interface OpenAITool {
   type: 'function'
@@ -232,6 +238,165 @@ function convertTools(
         parameters: t.input_schema ?? { type: 'object', properties: {} },
       },
     }))
+}
+
+function convertToolsForResponses(
+  tools: Array<{ name: string; description?: string; input_schema?: Record<string, unknown> }>,
+): Array<Record<string, unknown>> {
+  return tools
+    .filter(t => t.name !== 'ToolSearchTool')
+    .map(t => ({
+      type: 'function',
+      name: t.name,
+      description: t.description ?? '',
+      parameters: t.input_schema ?? { type: 'object', properties: {} },
+      strict: false,
+    }))
+}
+
+function convertContentBlocksToResponsesContent(
+  content: unknown,
+): Array<Record<string, unknown>> {
+  if (typeof content === 'string') {
+    return content ? [{ type: 'input_text', text: content }] : []
+  }
+  if (!Array.isArray(content)) {
+    return content ? [{ type: 'input_text', text: String(content) }] : []
+  }
+
+  const parts: Array<Record<string, unknown>> = []
+  for (const block of content) {
+    switch (block.type) {
+      case 'text':
+        if (block.text) parts.push({ type: 'input_text', text: block.text })
+        break
+      case 'image': {
+        const src = block.source
+        if (src?.type === 'base64') {
+          parts.push({
+            type: 'input_image',
+            image_url: `data:${src.media_type};base64,${src.data}`,
+          })
+        } else if (src?.type === 'url' && src.url) {
+          parts.push({ type: 'input_image', image_url: src.url })
+        }
+        break
+      }
+      case 'thinking':
+        if (block.thinking) {
+          parts.push({
+            type: 'input_text',
+            text: `<thinking>${block.thinking}</thinking>`,
+          })
+        }
+        break
+      default:
+        if (block.text) {
+          parts.push({ type: 'input_text', text: block.text })
+        }
+    }
+  }
+
+  return parts
+}
+
+function convertMessagesToResponsesInput(
+  messages: Array<{ role: string; message?: { role?: string; content?: unknown }; content?: unknown }>,
+): ResponsesInputItem[] {
+  const result: ResponsesInputItem[] = []
+
+  for (const msg of messages) {
+    const inner = msg.message ?? msg
+    const role = (inner as { role?: string }).role ?? msg.role
+    const content = (inner as { content?: unknown }).content
+
+    if (role === 'user') {
+      if (Array.isArray(content)) {
+        const toolResults = content.filter((b: { type?: string }) => b.type === 'tool_result')
+        const otherContent = content.filter((b: { type?: string }) => b.type !== 'tool_result')
+
+        for (const tr of toolResults) {
+          const trContent = Array.isArray(tr.content)
+            ? tr.content.map((c: { text?: string }) => c.text ?? '').join('\n')
+            : typeof tr.content === 'string'
+              ? tr.content
+              : JSON.stringify(tr.content ?? '')
+
+          result.push({
+            type: 'function_call_output',
+            call_id: tr.tool_use_id ?? 'unknown',
+            output: tr.is_error ? `Error: ${trContent}` : trContent,
+          })
+        }
+
+        const converted = convertContentBlocksToResponsesContent(otherContent)
+        if (converted.length > 0) {
+          result.push({
+            type: 'message',
+            role: 'user',
+            content: converted,
+          })
+        }
+      } else {
+        const converted = convertContentBlocksToResponsesContent(content)
+        if (converted.length > 0) {
+          result.push({
+            type: 'message',
+            role: 'user',
+            content: converted,
+          })
+        }
+      }
+      continue
+    }
+
+    if (role === 'assistant') {
+      if (Array.isArray(content)) {
+        const toolUses = content.filter((b: { type?: string }) => b.type === 'tool_use')
+        const textContent = content.filter(
+          (b: { type?: string }) => b.type !== 'tool_use' && b.type !== 'thinking',
+        )
+
+        const converted = convertContentBlocksToResponsesContent(textContent)
+        if (converted.length > 0) {
+          result.push({
+            type: 'message',
+            role: 'assistant',
+            content: converted.map(part =>
+              part.type === 'input_text'
+                ? { type: 'output_text', text: part.text }
+                : part,
+            ),
+          })
+        }
+
+        for (const tu of toolUses) {
+          result.push({
+            type: 'function_call',
+            call_id: tu.id ?? `call_${Math.random().toString(36).slice(2)}`,
+            name: tu.name ?? 'unknown',
+            arguments:
+              typeof tu.input === 'string' ? tu.input : JSON.stringify(tu.input ?? {}),
+          })
+        }
+      } else {
+        const converted = convertContentBlocksToResponsesContent(content)
+        if (converted.length > 0) {
+          result.push({
+            type: 'message',
+            role: 'assistant',
+            content: converted.map(part =>
+              part.type === 'input_text'
+                ? { type: 'output_text', text: part.text }
+                : part,
+            ),
+          })
+        }
+      }
+    }
+  }
+
+  return result
 }
 
 // ---------------------------------------------------------------------------
@@ -443,6 +608,273 @@ async function* openaiStreamToAnthropic(
   yield { type: 'message_stop' }
 }
 
+async function* responsesStreamToAnthropic(
+  response: Response,
+  model: string,
+): AsyncGenerator<AnthropicStreamEvent> {
+  const messageId = makeMessageId()
+  let activeTextIndex: number | null = null
+  let nextIndex = 0
+
+  yield {
+    type: 'message_start',
+    message: {
+      id: messageId,
+      type: 'message',
+      role: 'assistant',
+      content: [],
+      model,
+      stop_reason: null,
+      stop_sequence: null,
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+      },
+    },
+  }
+
+  const reader = response.body?.getReader()
+  if (!reader) {
+    yield { type: 'message_stop' }
+    return
+  }
+
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let stopReason: 'end_turn' | 'max_tokens' | 'tool_use' = 'end_turn'
+  let outputTokens = 0
+  let inputTokens = 0
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+
+    buffer += decoder.decode(value, { stream: true })
+    const chunks = buffer.split('\n\n')
+    buffer = chunks.pop() ?? ''
+
+    for (const chunk of chunks) {
+      const lines = chunk
+        .split('\n')
+        .map(line => line.trim())
+        .filter(Boolean)
+      const dataLine = lines.find(line => line.startsWith('data: '))
+      if (!dataLine) continue
+
+      let event: Record<string, any>
+      try {
+        event = JSON.parse(dataLine.slice(6))
+      } catch {
+        continue
+      }
+
+      switch (event.type) {
+        case 'response.output_text.delta': {
+          if (activeTextIndex === null) {
+            activeTextIndex = nextIndex++
+            yield {
+              type: 'content_block_start',
+              index: activeTextIndex,
+              content_block: { type: 'text', text: '' },
+            }
+          }
+          if (event.delta) {
+            yield {
+              type: 'content_block_delta',
+              index: activeTextIndex,
+              delta: { type: 'text_delta', text: event.delta },
+            }
+          }
+          break
+        }
+
+        case 'response.output_item.done': {
+          const item = event.item ?? {}
+          if (item.type === 'function_call') {
+            if (activeTextIndex !== null) {
+              yield {
+                type: 'content_block_stop',
+                index: activeTextIndex,
+              }
+              activeTextIndex = null
+            }
+
+            const toolIndex = nextIndex++
+            yield {
+              type: 'content_block_start',
+              index: toolIndex,
+              content_block: {
+                type: 'tool_use',
+                id: item.call_id ?? `call_${toolIndex}`,
+                name: item.name ?? 'unknown',
+                input: {},
+              },
+            }
+
+            if (item.arguments) {
+              yield {
+                type: 'content_block_delta',
+                index: toolIndex,
+                delta: {
+                  type: 'input_json_delta',
+                  partial_json: item.arguments,
+                },
+              }
+            }
+
+            yield {
+              type: 'content_block_stop',
+              index: toolIndex,
+            }
+            stopReason = 'tool_use'
+          } else if (item.type === 'message' && activeTextIndex !== null) {
+            yield {
+              type: 'content_block_stop',
+              index: activeTextIndex,
+            }
+            activeTextIndex = null
+          }
+          break
+        }
+
+        case 'response.completed': {
+          if (activeTextIndex !== null) {
+            yield {
+              type: 'content_block_stop',
+              index: activeTextIndex,
+            }
+            activeTextIndex = null
+          }
+
+          const usage = event.response?.usage
+          inputTokens = usage?.input_tokens ?? inputTokens
+          outputTokens = usage?.output_tokens ?? outputTokens
+
+          yield {
+            type: 'message_delta',
+            delta: { stop_reason: stopReason, stop_sequence: null },
+            usage: {
+              input_tokens: inputTokens,
+              output_tokens: outputTokens,
+            },
+          }
+          break
+        }
+      }
+    }
+  }
+
+  yield { type: 'message_stop' }
+}
+
+async function collectResponsesStreamResult(
+  response: Response,
+  model: string,
+) {
+  const reader = response.body?.getReader()
+  if (!reader) {
+    return {
+      id: makeMessageId(),
+      type: 'message',
+      role: 'assistant',
+      content: [],
+      model,
+      stop_reason: 'end_turn',
+      stop_sequence: null,
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+      },
+    }
+  }
+
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let responseId = makeMessageId()
+  let inputTokens = 0
+  let outputTokens = 0
+  const content: Array<Record<string, unknown>> = []
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+
+    buffer += decoder.decode(value, { stream: true })
+    const chunks = buffer.split('\n\n')
+    buffer = chunks.pop() ?? ''
+
+    for (const chunk of chunks) {
+      const dataLine = chunk
+        .split('\n')
+        .map(line => line.trim())
+        .find(line => line.startsWith('data: '))
+      if (!dataLine) continue
+
+      let event: Record<string, any>
+      try {
+        event = JSON.parse(dataLine.slice(6))
+      } catch {
+        continue
+      }
+
+      if (event.type === 'response.output_item.done') {
+        const item = event.item ?? {}
+        if (item.type === 'message') {
+          const text = Array.isArray(item.content)
+            ? item.content
+                .filter((part: { type?: string }) => part.type === 'output_text')
+                .map((part: { text?: string }) => part.text ?? '')
+                .join('')
+            : ''
+          if (text) {
+            content.push({ type: 'text', text })
+          }
+        } else if (item.type === 'function_call') {
+          let input: unknown
+          try {
+            input = JSON.parse(item.arguments ?? '{}')
+          } catch {
+            input = { raw: item.arguments ?? '' }
+          }
+          content.push({
+            type: 'tool_use',
+            id: item.call_id ?? makeMessageId(),
+            name: item.name ?? 'unknown',
+            input,
+          })
+        }
+      }
+
+      if (event.type === 'response.completed') {
+        responseId = event.response?.id ?? responseId
+        const usage = event.response?.usage
+        inputTokens = usage?.input_tokens ?? inputTokens
+        outputTokens = usage?.output_tokens ?? outputTokens
+      }
+    }
+  }
+
+  return {
+    id: responseId,
+    type: 'message',
+    role: 'assistant',
+    content,
+    model,
+    stop_reason: content.some(item => item.type === 'tool_use') ? 'tool_use' : 'end_turn',
+    stop_sequence: null,
+    usage: {
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+    },
+  }
+}
+
 // ---------------------------------------------------------------------------
 // The shim client — duck-types as Anthropic SDK
 // ---------------------------------------------------------------------------
@@ -479,15 +911,21 @@ class OpenAIShimMessages {
   private baseUrl: string
   private apiKey: string
   private defaultHeaders: Record<string, string>
+  private dialect: ShimDialect
+  private accountId?: string
 
   constructor(
     baseUrl: string,
     apiKey: string,
     defaultHeaders: Record<string, string>,
+    dialect: ShimDialect,
+    accountId?: string,
   ) {
     this.baseUrl = baseUrl
     this.apiKey = apiKey
     this.defaultHeaders = defaultHeaders
+    this.dialect = dialect
+    this.accountId = accountId
   }
 
   create(
@@ -501,10 +939,14 @@ class OpenAIShimMessages {
       const response = await self._doRequest(params, options)
       if (params.stream) {
         return new OpenAIShimStream(
-          openaiStreamToAnthropic(response, params.model),
+          self.dialect === 'responses'
+            ? responsesStreamToAnthropic(response, params.model)
+            : openaiStreamToAnthropic(response, params.model),
         )
       }
-      // Non-streaming: parse the full response and convert
+      if (self.dialect === 'responses') {
+        return collectResponsesStreamResult(response, params.model)
+      }
       const data = await response.json()
       return self._convertNonStreamingResponse(data, params.model)
     })()
@@ -527,50 +969,68 @@ class OpenAIShimMessages {
     params: ShimCreateParams,
     options?: { signal?: AbortSignal; headers?: Record<string, string> },
   ): Promise<Response> {
-    const openaiMessages = convertMessages(
-      params.messages as Array<{
-        role: string
-        message?: { role?: string; content?: unknown }
-        content?: unknown
-      }>,
-      params.system,
-    )
+    const messageParams = params.messages as Array<{
+      role: string
+      message?: { role?: string; content?: unknown }
+      content?: unknown
+    }>
 
-    const body: Record<string, unknown> = {
-      model: params.model,
-      messages: openaiMessages,
-      max_tokens: params.max_tokens,
-      stream: params.stream ?? false,
-    }
+    const isResponses = this.dialect === 'responses'
+    const body: Record<string, unknown> = isResponses
+      ? {
+          model: params.model,
+          instructions: convertSystemPrompt(params.system),
+          input: convertMessagesToResponsesInput(messageParams),
+          tools: [],
+          tool_choice: 'auto',
+          parallel_tool_calls: true,
+          store: false,
+          stream: true,
+          include: [],
+        }
+      : {
+          model: params.model,
+          messages: convertMessages(messageParams, params.system),
+          max_tokens: params.max_tokens,
+          stream: params.stream ?? false,
+        }
 
-    if (params.stream) {
+    if (!isResponses && params.stream) {
       body.stream_options = { include_usage: true }
     }
 
-    if (params.temperature !== undefined) body.temperature = params.temperature
-    if (params.top_p !== undefined) body.top_p = params.top_p
+    if (!isResponses && params.temperature !== undefined) body.temperature = params.temperature
+    if (!isResponses && params.top_p !== undefined) body.top_p = params.top_p
 
-    // Convert tools
     if (params.tools && params.tools.length > 0) {
-      const converted = convertTools(
-        params.tools as Array<{
-          name: string
-          description?: string
-          input_schema?: Record<string, unknown>
-        }>,
-      )
+      const converted = isResponses
+        ? convertToolsForResponses(
+            params.tools as Array<{
+              name: string
+              description?: string
+              input_schema?: Record<string, unknown>
+            }>,
+          )
+        : convertTools(
+            params.tools as Array<{
+              name: string
+              description?: string
+              input_schema?: Record<string, unknown>
+            }>,
+          )
       if (converted.length > 0) {
         body.tools = converted
-        // Convert tool_choice
         if (params.tool_choice) {
           const tc = params.tool_choice as { type?: string; name?: string }
           if (tc.type === 'auto') {
             body.tool_choice = 'auto'
           } else if (tc.type === 'tool' && tc.name) {
-            body.tool_choice = {
-              type: 'function',
-              function: { name: tc.name },
-            }
+            body.tool_choice = isResponses
+              ? { type: 'function', name: tc.name }
+              : {
+                  type: 'function',
+                  function: { name: tc.name },
+                }
           } else if (tc.type === 'any') {
             body.tool_choice = 'required'
           }
@@ -578,7 +1038,9 @@ class OpenAIShimMessages {
       }
     }
 
-    const url = `${this.baseUrl}/chat/completions`
+    const url = isResponses
+      ? `${this.baseUrl}/responses`
+      : `${this.baseUrl}/chat/completions`
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       ...this.defaultHeaders,
@@ -587,6 +1049,10 @@ class OpenAIShimMessages {
 
     if (this.apiKey) {
       headers['Authorization'] = `Bearer ${this.apiKey}`
+    }
+    if (this.accountId) {
+      headers['ChatGPT-Account-ID'] = this.accountId
+      headers['Accept'] = 'text/event-stream'
     }
 
     const response = await fetch(url, {
@@ -684,8 +1150,16 @@ class OpenAIShimBeta {
     baseUrl: string,
     apiKey: string,
     defaultHeaders: Record<string, string>,
+    dialect: ShimDialect,
+    accountId?: string,
   ) {
-    this.messages = new OpenAIShimMessages(baseUrl, apiKey, defaultHeaders)
+    this.messages = new OpenAIShimMessages(
+      baseUrl,
+      apiKey,
+      defaultHeaders,
+      dialect,
+      accountId,
+    )
   }
 }
 
@@ -701,19 +1175,32 @@ export function createOpenAIShimClient(options: {
   maxRetries?: number
   timeout?: number
 }): unknown {
+  const wantsCodexOAuth =
+    process.env.OPENAI_AUTH_MODE === 'codex' ||
+    process.env.OPENAI_USE_CODEX_OAUTH === '1'
+  const codexSession = wantsCodexOAuth ? getCodexAuthSession() : null
+  const dialect: ShimDialect = codexSession ? 'responses' : 'chat-completions'
   const baseUrl = (
     process.env.OPENAI_BASE_URL ??
     process.env.OPENAI_API_BASE ??
-    'https://api.openai.com/v1'
+    (codexSession
+      ? 'https://chatgpt.com/backend-api/codex'
+      : 'https://api.openai.com/v1')
   ).replace(/\/+$/, '')
 
-  const apiKey = process.env.OPENAI_API_KEY ?? ''
+  const apiKey = codexSession?.accessToken ?? process.env.OPENAI_API_KEY ?? ''
 
   const headers = {
     ...(options.defaultHeaders ?? {}),
   }
 
-  const beta = new OpenAIShimBeta(baseUrl, apiKey, headers)
+  const beta = new OpenAIShimBeta(
+    baseUrl,
+    apiKey,
+    headers,
+    dialect,
+    codexSession?.accountId,
+  )
 
   // Duck-type as Anthropic client
   return {
